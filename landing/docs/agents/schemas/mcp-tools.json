@@ -538,6 +538,35 @@
       }
     },
     {
+      "name": "xerj_index_budget",
+      "description": "Count a folder and estimate the index BEFORE xerj autoindex hashes or embeds anything. Returns file and byte counts by kind (code, prose, pdf, data, binary, other — by extension, before content sniff) and by top-level folder, the free-space budget from the node's flood-stage watermark (the same GET /_cat/allocation row autoindex uses; a node that omits disk.flood_stage is not guessed at), and one or more plans with what each drops. This tool does not index. When decision_required is true, show the plans to the user and re-run `xerj autoindex` with --plan <name> or --yes for the recommended plan that fits. Do not start a run that does not fit. Default embeddings in the estimate are the server's lexical feature-hash vectors unless that node was started with --embed-mode neural. Kinds without a measured calibration are unmeasured and do not refuse the run.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Folder to count. Nothing inside it is hashed."
+          },
+          "prefix": {
+            "type": "string",
+            "description": "Index prefix to check for an existing copy of this folder (default ax)."
+          },
+          "max_index_bytes": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional cap on the estimated index, in bytes. The disk budget is the free space under the flood-stage watermark; this lowers it."
+          },
+          "no_semantic": {
+            "type": "boolean",
+            "description": "Price the plans without semantic_text vectors, as --no-semantic would."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
       "name": "xerj_code_search",
       "description": "Reference-coding retrieval over a corpus of peer projects: how did real codebases solve this problem? Returns the matching definition (not a byte window), the file:line to cite, and per-hit licence warnings — AGPL/SSPL/Elastic/BUSL/GPL/LGPL/MPL sources are approach-only. Refuses indices older than 30 days (override with stale_ok). A no-match is NOT an error: it says the corpus is wrong for the task. Pass `max_tokens` to cap the response at a token budget (never exceeded; see that argument for the tokenizer and the locator-only rule). Corpora: `xerj corpus list`.",
       "inputSchema": {

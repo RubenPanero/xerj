@@ -330,6 +330,30 @@ pub fn sanitize_prefix(s: &str) -> String {
     out
 }
 
+/// Why `{prefix}-docs` cannot be an index name, if it cannot.
+///
+/// #2057: the server used to be the first thing that noticed a digit-leading
+/// prefix, and it noticed after the hash. `None` means the prefix can name
+/// an index.
+pub fn index_prefix_error(prefix: &str) -> Option<String> {
+    let index = format!("{prefix}-docs");
+    match xerj_common::IndexName::validate(&index) {
+        Ok(()) => None,
+        Err(err) => {
+            let hint = if prefix.starts_with(|c: char| c.is_ascii_digit()) {
+                format!(" A prefix that starts with a letter works, for example p{prefix}.")
+            } else {
+                String::new()
+            };
+            Some(format!(
+                "--prefix {prefix} is not a valid index prefix: an index is named \
+                 {prefix}-<dataset>, and `{index}` is rejected ({err}). An index name must \
+                 start with a lowercase letter or '.'.{hint} Nothing was walked."
+            ))
+        }
+    }
+}
+
 fn numericish_segment(s: &str) -> bool {
     let t = s.trim();
     !t.is_empty()
@@ -496,6 +520,15 @@ pub fn drop_repeated_prefix(prefix: &str, clusters: &mut [Cluster]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_digit_leading_prefix_is_rejected_before_any_walk() {
+        let err = index_prefix_error("2042").expect("2042-docs is not an index name");
+        assert!(err.contains("lowercase letter"), "{err}");
+        assert!(err.contains("p2042"), "{err}");
+        assert!(err.contains("Nothing was walked"), "{err}");
+        assert!(index_prefix_error("proj").is_none());
+    }
 
     #[test]
     fn sanitize_prefix_keeps_a_literal_double_hyphen() {

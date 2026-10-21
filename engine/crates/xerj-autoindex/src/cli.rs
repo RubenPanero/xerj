@@ -111,6 +111,13 @@ pub struct IndexCfg {
     /// An answer to a previous decision request. `None` means "nobody has
     /// answered yet", which is what arms the gate.
     pub approve: Option<Approval>,
+    /// `--max-index-size`, in bytes. `None` means the only budget is the free
+    /// space under the node's flood-stage watermark, when the node reports one.
+    pub max_index_bytes: Option<u64>,
+    /// `--plan`. `None` means the default plan, which is indexed when it fits
+    /// and refused when it does not. A named plan runs even when the estimate
+    /// says it does not fit (with a warning): that is the override.
+    pub budget_plan: Option<String>,
     pub json: bool,
     pub quiet: bool,
     /// Progress surface. Orthogonal to `json`: `--json` shapes *stdout* (the
@@ -380,7 +387,19 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20`fast` also applies --no-semantic --no-graph. `narrower`\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20is NOT accepted here — it means re-running against a\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20subdirectory, which this flag cannot do.\n\
-         \x20\x20\x20\x20--yes, -y            alias for --approve proceed\n\
+         \x20\x20\x20\x20--yes, -y            alias for --approve proceed. When the default index\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20plan does not fit the disk budget, --yes takes the\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20recommended plan that does fit. It does not index a\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20plan that is over budget.\n\
+         \x20\x20\x20\x20--max-index-size <N> cap the estimated index (bytes, or a KB/MB/GB suffix).\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20The disk budget is the free space under the node's\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20flood-stage watermark; this flag lowers that cap.\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x200 is rejected\n\
+         \x20\x20\x20\x20--plan <NAME>        index with one plan: default, skip-vendored, skip-data,\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20code-and-docs, no-vectors, cap-1mb,\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20code-and-docs-no-vectors. A named plan runs even\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20when the estimate says it does not fit (warned).\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20See DISK BUDGET.\n\
          \x20\x20\x20\x20--dry-run            walk+sniff+infer, print the plan, index nothing\n\
          \x20\x20\x20\x20--label <FILE>       label each document at ingest through POST /_decide\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(#1062): the question-set file's noul/choice questions\n\
@@ -659,6 +678,23 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20Credentials come from the environment only: AWS_ACCESS_KEY_ID,\n\
          \x20\x20\x20\x20AWS_SECRET_ACCESS_KEY, optionally AWS_SESSION_TOKEN. Never from a flag.\n\
          \n\
+         DISK BUDGET:\n\
+         \x20\x20\x20\x20Before hashing, autoindex counts files by extension (code, prose, pdf,\n\
+         \x20\x20\x20\x20data, binary, other) and by top-level folder, and estimates the index\n\
+         \x20\x20\x20\x20from measured per-kind ratios. The budget is the free space on the\n\
+         \x20\x20\x20\x20node's data volume under the flood-stage watermark (the same\n\
+         \x20\x20\x20\x20GET /_cat/allocation read that refuses a volume already at the\n\
+         \x20\x20\x20\x20watermark), optionally lowered with --max-index-size. A node that does\n\
+         \x20\x20\x20\x20not report disk.flood_stage is not guessed at. When the default plan\n\
+         \x20\x20\x20\x20fits, the run continues. When it does not, stdout carries a JSON plan\n\
+         \x20\x20\x20\x20list and the run exits 4 unless --yes takes the recommended plan that\n\
+         \x20\x20\x20\x20fits, or --plan names one (a named plan is the override: it runs\n\
+         \x20\x20\x20\x20over the estimate with a warning; the estimate errs high).\n\
+         \x20\x20\x20\x20A terminal with the question visible is asked. Kinds without a\n\
+         \x20\x20\x20\x20calibration are reported as unmeasured and do not refuse the run.\n\
+         \x20\x20\x20\x20Skipped files are listed after the ok: line (up to 20, then a count).\n\
+         \x20\x20\x20\x20A folder already indexed under another prefix is named before the walk.\n\
+         \n\
          EXIT CODES: 0 complete (also: gate answered with --approve cancel);\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x203 completed-with-junk (junk recorded, never fatal) — SUCCESS:\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20the index is searchable, and the summary on stdout opens\n\
@@ -678,9 +714,11 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20`skipped_appeared` names them. Re-run with --fresh to\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20rebuild the plan in place and include them. Read `reason`\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20to tell this apart from completed-with-junk;\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x204 NEEDS A DECISION — the estimate exceeded --max-minutes, or a\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20--watch poll cost more than --max-monthly-ops; nothing was\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20indexed and a JSON decision request is on stdout;\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x204 NEEDS A DECISION — the estimate exceeded --max-minutes, the\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20estimated index does not fit the disk budget, or a --watch\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20poll cost more than --max-monthly-ops; nothing was indexed\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20and a JSON decision request is on stdout. A plan that does\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20not fit is not started, including with --yes;\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x202 usage; 1 endpoint/journal failure, a refused corpus removal, or a\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20refused unsafe state transition\n",
         feedback_block = xerj_common::feedback::block(feedback),
@@ -825,6 +863,9 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut max_minutes_explicit = false;
     let mut approve: Option<Approval> = None;
     let mut approve_explicit = false;
+    let mut max_index_bytes: Option<u64> = None;
+    let mut max_index_explicit = false;
+    let mut budget_plan: Option<String> = None;
     let mut json = false;
     let mut quiet = false;
     let mut progress: Option<ProgressMode> = None;
@@ -1043,6 +1084,31 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 approve = Some(parsed);
                 approve_explicit = true;
             }
+            "--max-index-size" => {
+                max_index_explicit = true;
+                let raw = it
+                    .next()
+                    .ok_or("--max-index-size needs a size in bytes or with a KB/MB/GB suffix")?;
+                max_index_bytes = Some(crate::budget::parse_byte_size(&raw)?);
+            }
+            "--plan" => {
+                let raw = it.next().ok_or_else(|| {
+                    format!(
+                        "--plan needs one of: {}",
+                        crate::budget::PLAN_NAMES.join(", ")
+                    )
+                })?;
+                if !crate::budget::PLAN_NAMES.contains(&raw.as_str()) {
+                    return Err(format!(
+                        "--plan {raw} is not a plan. choices: {}",
+                        crate::budget::PLAN_NAMES.join(", ")
+                    ));
+                }
+                if budget_plan.is_some() {
+                    return Err("--plan was given twice".into());
+                }
+                budget_plan = Some(raw);
+            }
             "--yes" | "-y" => {
                 if let Some(previous) = approve {
                     if previous != Approval::Proceed {
@@ -1227,6 +1293,10 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let prefix = crate::dataset::sanitize_prefix(&prefix);
     if prefix.is_empty() {
         return Err("--prefix must contain at least one [a-z0-9] character".into());
+    }
+    // #2057: reject a prefix that cannot name an index before the walk.
+    if let Some(err) = crate::dataset::index_prefix_error(&prefix) {
+        return Err(err);
     }
 
     // Contradictory progress requests are refused, never silently resolved in
@@ -1524,10 +1594,10 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                     .into(),
             );
         }
-        if max_minutes_explicit || approve_explicit {
+        if max_minutes_explicit || approve_explicit || max_index_explicit || budget_plan.is_some() {
             return Err(
-                "--max-minutes/--approve/--yes are the folder-indexing gate; a watch has its own \
-                 cost gate (--max-monthly-ops, --allow-cost)"
+                "--max-minutes/--approve/--yes/--max-index-size/--plan are the folder-indexing \
+                 gate; a watch has its own cost gate (--max-monthly-ops, --allow-cost)"
                     .into(),
             );
         }
@@ -1600,9 +1670,15 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     }
 
     match (sub.as_deref(), folder) {
-        (Some("map"), _) | (Some("status"), _) if max_minutes_explicit || approve_explicit => {
+        (Some("map"), _) | (Some("status"), _)
+            if max_minutes_explicit
+                || approve_explicit
+                || max_index_explicit
+                || budget_plan.is_some() =>
+        {
             Err(format!(
-                "--max-minutes/--approve/--yes apply only to indexing, not `autoindex {}`",
+                "--max-minutes/--approve/--yes/--max-index-size/--plan apply only to indexing, \
+                 not `autoindex {}`",
                 sub.as_deref().unwrap_or_default()
             ))
         }
@@ -1738,6 +1814,8 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 dry_run,
                 max_minutes,
                 approve,
+                max_index_bytes,
+                budget_plan,
                 json,
                 quiet,
                 progress,
@@ -2646,6 +2724,9 @@ mod tests {
             "--max-minutes",
             "--approve <ID>",
             "--yes, -y",
+            "--max-index-size",
+            "--plan <NAME>",
+            "DISK BUDGET:",
             "0 disables the gate",
             "ESTIMATE + DECISION GATE:",
             "exits 4",
@@ -2661,6 +2742,20 @@ mod tests {
         ] {
             assert!(help.contains(expected), "help is missing {expected:?}");
         }
+    }
+
+    /// #2057: a digit-leading prefix is a usage error, before any walk. The
+    /// budget flags parse here too, and an unknown plan is refused.
+    #[test]
+    fn a_digit_leading_prefix_and_an_unknown_plan_are_usage_errors() {
+        let prefix_err = err(&["data", "--prefix", "2042"]);
+        assert!(prefix_err.contains("p2042"), "{prefix_err}");
+        assert!(prefix_err.contains("lowercase letter"), "{prefix_err}");
+        let cfg = index(&["data", "--plan", "code-and-docs", "--max-index-size", "2MB"]);
+        assert_eq!(cfg.budget_plan.as_deref(), Some("code-and-docs"));
+        assert_eq!(cfg.max_index_bytes, Some(2 * 1024 * 1024));
+        let plan_err = err(&["data", "--plan", "everything"]);
+        assert!(plan_err.contains("not a plan"), "{plan_err}");
     }
 
     /// A `\` at the end of a help line used to eat the next line's indent, so

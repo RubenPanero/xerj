@@ -384,6 +384,8 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, label: &Path) -> IndexCfg {
         no_graph: true,
         max_minutes: 0,
         approve: None,
+        max_index_bytes: None,
+        budget_plan: None,
         dry_run: false,
         json: false,
         quiet: true,

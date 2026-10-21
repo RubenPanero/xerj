@@ -9,11 +9,12 @@
 //!
 //! It speaks the MCP **stdio transport**: newline-delimited
 //! JSON-RPC 2.0 messages on stdin/stdout. It exposes XERJ to any MCP-capable
-//! agent host (Claude Desktop, IDE agents, custom orchestrators) as eighteen
-//! tools: fifteen without a hub key, and three Corpus Hub tools
+//! agent host (Claude Desktop, IDE agents, custom orchestrators) as nineteen
+//! tools: sixteen without a hub key, and three Corpus Hub tools
 //! (`xerj_hub_*`) that run the `xerj ask` flow itself. Thirteen of those
-//! fifteen construct exactly the request the running engine already accepts
-//! and forward it to a configurable base URL. `xerj_corpus_feedback` posts an
+//! sixteen construct exactly the request the running engine already accepts
+//! and forward it to a configurable base URL. `xerj_index_budget` counts a
+//! folder and returns the budget plans; it does not index. `xerj_corpus_feedback` posts an
 //! agent's review of a hub corpus to hub.xerj.org. `xerj_field_report` does not:
 //! it files a field report, not to the node: a GitHub PR first (through
 //! `xerj feedback --submit --github-only`), and a POST to the web endpoint only
@@ -1128,6 +1129,47 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
             }
         },
         {
+            "name": "xerj_index_budget",
+            "description": concat!(
+                "Count a folder and estimate the index BEFORE xerj autoindex hashes or ",
+                "embeds anything. Returns file and byte counts by kind (code, prose, pdf, ",
+                "data, binary, other — by extension, before content sniff) and by top-level ",
+                "folder, the free-space budget from the node's flood-stage watermark ",
+                "(the same GET /_cat/allocation row autoindex uses; a node that omits ",
+                "disk.flood_stage is not guessed at), and one or more plans with what ",
+                "each drops. This tool does not index. When decision_required is true, ",
+                "show the plans to the user and re-run `xerj autoindex` with --plan <name> ",
+                "or --yes for the recommended plan that fits. Do not start a run that ",
+                "does not fit. Default embeddings in the estimate are the server's ",
+                "lexical feature-hash vectors unless that node was started with ",
+                "--embed-mode neural. Kinds without a measured calibration are ",
+                "unmeasured and do not refuse the run."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Folder to count. Nothing inside it is hashed."
+                    },
+                    "prefix": {
+                        "type": "string",
+                        "description": "Index prefix to check for an existing copy of this folder (default ax)."
+                    },
+                    "max_index_bytes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional cap on the estimated index, in bytes. The disk budget is the free space under the flood-stage watermark; this lowers it."
+                    },
+                    "no_semantic": {
+                        "type": "boolean",
+                        "description": "Price the plans without semantic_text vectors, as --no-semantic would."
+                    }
+                },
+                "required": ["path"]
+            }
+        },
+        {
             "name": "xerj_code_search",
             "description": concat!(
                 "Reference-coding retrieval over a corpus of peer projects: how did ",
@@ -1769,6 +1811,7 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
         // code_search — it renders the per-index field map itself, so it
         // returns a tool result directly instead of a BuiltRequest.
         "xerj_map" => return map::run(ctx, &args).await,
+        "xerj_index_budget" => return run_index_budget(ctx, &args).await,
         "xerj_code_search" => return run_code_search(ctx, &args).await,
         // Corpus Hub v2 (plan §7): the `xerj ask` flow itself, not a proxy.
         hub_tool if hub_tool.starts_with("xerj_hub_") => {
@@ -2504,6 +2547,68 @@ impl xerj_common::xccode::XcHttp for McpXc {
     }
     fn search(&self, index: &str, body: &Value) -> Result<Value, String> {
         self.request("POST", &format!("/{index}/_search"), Some(body))
+    }
+}
+
+/// `xerj_index_budget` — the autoindex preflight, without indexing.
+///
+/// The walk and the plan math are `xerj_autoindex::budget`. Disk numbers come
+/// from the same allocation probe autoindex uses. A node that is down still
+/// returns the file counts; the disk field is then null.
+async fn run_index_budget(ctx: &Ctx, args: &Value) -> Value {
+    let path = match args.get("path").and_then(Value::as_str) {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => return tool_text("xerj_index_budget: `path` is required", true),
+    };
+    let prefix = args
+        .get("prefix")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("ax")
+        .to_string();
+    let no_semantic = match args.get("no_semantic") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(v)) => *v,
+        Some(_) => return tool_text("xerj_index_budget: `no_semantic` must be a boolean", true),
+    };
+    let max_index_bytes = match args.get("max_index_bytes") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(n) if n > 0 => Some(n),
+            _ => {
+                return tool_text(
+                    "xerj_index_budget: `max_index_bytes` must be a positive integer",
+                    true,
+                )
+            }
+        },
+        Some(_) => {
+            return tool_text(
+                "xerj_index_budget: `max_index_bytes` must be a positive integer",
+                true,
+            )
+        }
+    };
+    let url = ctx.base_url.clone();
+    let auth = ctx.auth.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        xerj_autoindex::budget::assess_path(
+            std::path::Path::new(&path),
+            &url,
+            auth.as_deref(),
+            &prefix,
+            max_index_bytes,
+            no_semantic,
+        )
+    })
+    .await;
+    match joined {
+        Ok(Ok(body)) => tool_text(
+            serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string()),
+            false,
+        ),
+        Ok(Err(err)) => tool_text(format!("xerj_index_budget: {err:#}"), true),
+        Err(err) => tool_text(format!("xerj_index_budget: {err}"), true),
     }
 }
 
@@ -4280,7 +4385,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), 19);
         for n in [
             "xerj_search",
             "xerj_semantic_search",
@@ -4294,6 +4399,7 @@ mod tests {
             "xerj_brain_overview",
             // #1055: the per-index field map from the autoindex catalog.
             "xerj_map",
+            "xerj_index_budget",
             // #977: reference-coding retrieval, served by the same pipeline
             // as `xerj code`.
             "xerj_code_search",
@@ -4370,23 +4476,23 @@ mod tests {
                 .collect()
         };
         let without = names(false);
-        assert_eq!(without.len(), 15, "{without:?}");
+        assert_eq!(without.len(), 16, "{without:?}");
         assert!(
             without.iter().all(|n| !n.starts_with("xerj_hub_")),
             "{without:?}"
         );
         let with = names(true);
-        assert_eq!(with.len(), 18, "{with:?}");
+        assert_eq!(with.len(), 19, "{with:?}");
         for n in ["xerj_hub_find", "xerj_hub_def", "xerj_hub_ask"] {
             assert!(with.iter().any(|name| name == n), "missing {n}");
         }
 
         let help = tools_paragraph(false);
-        assert!(help.contains("proxies 15 tools"), "{help}");
+        assert!(help.contains("proxies 16 tools"), "{help}");
         assert!(!help.contains("xerj_hub_"), "{help}");
         assert!(help.contains("~/xerj-data"), "{help}");
         let help = tools_paragraph(true);
-        assert!(help.contains("proxies 18 tools"), "{help}");
+        assert!(help.contains("proxies 19 tools"), "{help}");
         assert!(help.contains("xerj_hub_ask"), "{help}");
         assert!(help.contains("serves 3 Corpus Hub tools"), "{help}");
     }

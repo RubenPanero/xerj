@@ -49,6 +49,10 @@ unicode-segmentation = "1"
 # itself (`xerj_hub::ask`), the one implementation the CLI and the gRPC
 # service share — the tools are adapters, not a second copy of the flow.
 xerj-hub = { path = "../xerj-hub" }
+# `xerj_index_budget` walks a folder and prices it before hashing. The walk,
+# the flood-stage allocation parse, and the plan list live in xerj-autoindex;
+# this crate only exposes them. No cycle: autoindex does not depend on mcp.
+xerj-autoindex = { path = "../xerj-autoindex" }
 
 [dev-dependencies]
 # The loopback admin-key fallback tests sandbox cwd + HOME so discovery sees

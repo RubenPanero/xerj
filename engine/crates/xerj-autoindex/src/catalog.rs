@@ -2,6 +2,8 @@
 //! wildcard so data-wide searches never hit metadata. Its dataset docs ARE
 //! the agent-facing data map; `xerj autoindex map` renders them.
 
+use std::collections::BTreeMap;
+
 use crate::correlate::KeyCorr;
 use crate::state::PlanDataset;
 use serde_json::{json, Value};
@@ -595,6 +597,54 @@ pub fn foreign_prefix_roots(runs: &[Value], prefix: &str, root: &str) -> Vec<Str
         }
     }
     foreign.into_iter().collect()
+}
+
+/// Prefixes other than `prefix` whose latest run recorded this same `root`.
+///
+/// #2078: indexing one folder twice, under `ax` and under a named prefix,
+/// does not collide on catalog ids, so it is a warning rather than the
+/// refusal [`foreign_prefix_roots`] produces. `root` is not a mapped catalog
+/// field; callers fetch `doc_kind: run` and filter here.
+pub fn other_prefixes_for_root(runs: &[Value], root: &str, prefix: &str) -> Vec<String> {
+    let mut latest: BTreeMap<&str, &str> = BTreeMap::new();
+    for run in runs {
+        if run.get("doc_kind").and_then(Value::as_str) != Some("run") {
+            continue;
+        }
+        let Some(recorded) = run.get("prefix").and_then(Value::as_str) else {
+            continue;
+        };
+        if recorded == prefix || recorded.is_empty() {
+            continue;
+        }
+        if run.get("root").and_then(Value::as_str) != Some(root) {
+            continue;
+        }
+        let started = run.get("started").and_then(Value::as_str).unwrap_or("");
+        match latest.get(recorded) {
+            Some(prev) if *prev >= started => {}
+            _ => {
+                latest.insert(recorded, started);
+            }
+        }
+    }
+    latest.into_keys().map(str::to_string).collect()
+}
+
+/// One line. `warn` strips newlines, so this stays a single sentence.
+pub fn same_root_other_prefix_line(prefix: &str, others: &[String]) -> String {
+    let listed = others
+        .iter()
+        .map(|other| format!("{other} (indices {other}-*)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let first = others.first().map(String::as_str).unwrap_or(prefix);
+    format!(
+        "autoindex: this folder is already indexed under {listed}. This run uses {prefix} and \
+         will index it again. Re-run with --prefix {first} to update that copy instead. Both \
+         copies are kept: a {first}-* index can also hold other folders, so nothing here \
+         suggests deleting it."
+    )
 }
 
 /// What a reused prefix will do, for both the refusal and the
@@ -1480,6 +1530,29 @@ mod prefix_reuse_tests {
         assert_eq!(
             foreign_prefix_roots(&runs, "ref", "/data/stockfish"),
             vec![UNRECORDED_PREFIX_ROOT.to_string()]
+        );
+    }
+
+    #[test]
+    fn the_same_folder_under_another_prefix_is_named() {
+        let runs = vec![
+            json!({"doc_kind": "run", "prefix": "ax", "root": "/data/proj", "started": "2026-01-01T00:00:00Z"}),
+            json!({"doc_kind": "run", "prefix": "ax", "root": "/data/old", "started": "2026-02-01T00:00:00Z"}),
+            json!({"doc_kind": "run", "prefix": "proj", "root": "/data/proj", "started": "2026-03-01T00:00:00Z"}),
+        ];
+        assert_eq!(
+            other_prefixes_for_root(&runs, "/data/proj", "proj"),
+            vec!["ax".to_string()]
+        );
+        let line = same_root_other_prefix_line("proj", &["ax".into()]);
+        assert!(line.contains("under ax"), "{line}");
+        // `ax` also holds /data/old here, so a delete hint would destroy a
+        // folder this run never touched (#2114).
+        assert!(!line.contains("DELETE"), "{line}");
+        assert!(line.contains("--prefix ax"), "{line}");
+        assert_eq!(
+            other_prefixes_for_root(&runs, "/data/proj", "ax"),
+            vec!["proj".to_string()]
         );
     }
 

@@ -970,6 +970,8 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, semantic: bool) -> IndexCfg {
         // timing-derived stop. See `gate_tests` and `cli::tests`.
         max_minutes: 0,
         approve: None,
+        max_index_bytes: None,
+        budget_plan: None,
         dry_run: false,
         json: false,
         quiet: true,
@@ -6408,6 +6410,93 @@ mod delete_gate {
         drop(st);
         assert!(stale_gone, "the stale partial is gone");
         assert!(landed, "the replayed document landed");
+    }
+
+    /// A cap between the measured `code-and-docs` estimate and the default
+    /// estimate stops before any data bulk (exit 4). `--plan code-and-docs`
+    /// is the plan that fits, and the csv it drops is not indexed. The sizes
+    /// come from `budget::MEASURED`. An empty table fails here: skipping would
+    /// hide a gate that can no longer tell the plans apart.
+    #[test]
+    fn a_budget_too_small_for_the_default_plan_accepts_a_smaller_one() {
+        let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let corpus = tempfile::tempdir().unwrap();
+        fs::write(
+            corpus.path().join("main.rs"),
+            "fn main() { println!(\"budget\"); }\n",
+        )
+        .unwrap();
+        let mut csv = String::from("id,value\n");
+        for i in 0..2000 {
+            csv.push_str(&format!("{i},row-{i}-budget-padding\n"));
+        }
+        fs::write(corpus.path().join("big.csv"), csv).unwrap();
+
+        let (files, _) = walk::walk_reporting_opts(
+            corpus.path(),
+            false,
+            false,
+            crate::ignore_rules::IgnoreOptions::default(),
+        )
+        .unwrap();
+        let priced = budget::assess(&budget::Request {
+            root: corpus.path().to_str().unwrap_or("/corpus"),
+            files: &files,
+            volume: None,
+            max_index_bytes: Some(u64::MAX),
+            no_semantic: true,
+            plan: None,
+            approve: None,
+            duplicate_prefixes: &[],
+        });
+        let plan_bytes = |name: &str| -> u64 {
+            let plan = priced.body["plans"]
+                .as_array()
+                .and_then(|plans| plans.iter().find(|plan| plan["name"] == name))
+                .unwrap_or_else(|| panic!("missing plan {name} in {}", priced.body));
+            plan["index_bytes"].as_u64().unwrap_or_else(|| {
+                panic!(
+                    "plan {name} has no measured index size. Fill budget::MEASURED from a real \
+                     xerj run; an unmeasured kind must not be given a guessed ratio. {}",
+                    priced.body
+                )
+            })
+        };
+        let default_bytes = plan_bytes("default");
+        let reduced_bytes = plan_bytes("code-and-docs");
+        assert!(
+            reduced_bytes < default_bytes,
+            "code-and-docs ({reduced_bytes}) has to be smaller than default ({default_bytes}) \
+             so the cap can sit between them"
+        );
+
+        let endpoint = HttpEndpoint::start();
+        let refused_state = tempfile::tempdir().unwrap();
+        let mut refused = cfg(corpus.path(), refused_state.path(), &endpoint.url, false);
+        refused.prefix = "budget-http".into();
+        refused.max_index_bytes = Some(reduced_bytes);
+        assert_eq!(run_index(refused).unwrap(), gate::EXIT_NEEDS_DECISION);
+        assert_eq!(
+            endpoint.data_bulk_requests(),
+            0,
+            "a plan that does not fit must not bulk-index"
+        );
+
+        let accepted_state = tempfile::tempdir().unwrap();
+        let mut accepted = cfg(corpus.path(), accepted_state.path(), &endpoint.url, false);
+        accepted.prefix = "budget-http".into();
+        accepted.max_index_bytes = Some(reduced_bytes);
+        accepted.budget_plan = Some("code-and-docs".into());
+        assert_eq!(run_index(accepted).unwrap(), 0);
+        let indexed = paths(&endpoint.data_docs());
+        assert!(
+            indexed.iter().any(|path| path.ends_with("main.rs")),
+            "the code file is the part the plan keeps: {indexed:?}"
+        );
+        assert!(
+            indexed.iter().all(|path| !path.ends_with("big.csv")),
+            "the csv is the part the plan drops: {indexed:?}"
+        );
     }
 
     fn base() -> CommittedManifest {

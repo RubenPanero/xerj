@@ -20,15 +20,73 @@ use crate::esclient::Es;
 
 const ALLOCATION_PATH: &str = "/_cat/allocation?format=json";
 
-/// `None` when the node cannot be asked or does not report a flood-stage
-/// threshold. A stats blip must not abort a run whose disk is fine, and the
-/// write path still refuses if the block is actually engaged.
-pub(crate) fn refusal(es: &Es) -> Option<String> {
-    let (status, body) = es.request_json("GET", ALLOCATION_PATH, None).ok()?;
+/// One row of `GET /_cat/allocation?format=json`.
+///
+/// The budget gate reads free space and the flood threshold from this same
+/// response. It does not issue a second probe, and it does not fill in a
+/// threshold the node left out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Volume {
+    pub total: Option<u64>,
+    pub avail: Option<u64>,
+    pub used_percent: Option<u64>,
+    pub flood_stage: Option<u8>,
+    pub threshold_enabled: bool,
+    pub flood_blocked: bool,
+}
+
+/// The one allocation read: the parsed volume, and the refusal when the
+/// node says writes will fail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Probe {
+    pub volume: Option<Volume>,
+    pub refusal: Option<String>,
+}
+
+/// `None` fields when the node cannot be asked. A stats blip must not abort
+/// a run whose disk is fine, and the write path still refuses if the block
+/// is actually engaged.
+pub(crate) fn probe(es: &Es) -> Probe {
+    let Ok((status, body)) = es.request_json("GET", ALLOCATION_PATH, None) else {
+        return Probe {
+            volume: None,
+            refusal: None,
+        };
+    };
     if !(200..300).contains(&status) {
-        return None;
+        return Probe {
+            volume: None,
+            refusal: None,
+        };
     }
-    refusal_from_allocation(&body)
+    Probe {
+        volume: volume_from_allocation(&body),
+        refusal: refusal_from_allocation(&body),
+    }
+}
+
+/// Parsed disk columns from one allocation body. `None` when the body is
+/// not an allocation row (the HTTP doubles answer `{"acknowledged": true}`).
+pub(crate) fn volume_from_allocation(body: &Value) -> Option<Volume> {
+    let row = body.as_array()?.first()?;
+    let flood_stage = row
+        .get("disk.flood_stage")
+        .and_then(parse_u64)
+        .and_then(|n| u8::try_from(n.min(100)).ok());
+    Some(Volume {
+        total: row.get("disk.total").and_then(parse_bytes),
+        avail: row.get("disk.avail").and_then(parse_bytes),
+        used_percent: row.get("disk.percent").and_then(parse_u64),
+        flood_stage,
+        threshold_enabled: row
+            .get("disk.threshold_enabled")
+            .and_then(parse_bool)
+            .unwrap_or(true),
+        flood_blocked: row
+            .get("disk.flood_blocked")
+            .and_then(parse_bool)
+            .unwrap_or(false),
+    })
 }
 
 /// Decide from one `/_cat/allocation?format=json` body.
@@ -212,6 +270,24 @@ mod tests {
         .is_none());
         assert!(refusal_from_allocation(&json!({"acknowledged": true})).is_none());
         assert!(refusal_from_allocation(&json!([])).is_none());
+    }
+
+    #[test]
+    fn the_same_row_carries_free_and_total_bytes_for_the_budget() {
+        let body = json!([{
+            "disk.percent": "40",
+            "disk.avail": "1000b",
+            "disk.total": "10000b",
+            "disk.flood_stage": "95",
+            "disk.threshold_enabled": "true",
+            "disk.flood_blocked": "false",
+        }]);
+        let volume = volume_from_allocation(&body).expect("an allocation row");
+        assert_eq!(volume.avail, Some(1000));
+        assert_eq!(volume.total, Some(10000));
+        assert_eq!(volume.used_percent, Some(40));
+        assert_eq!(volume.flood_stage, Some(95));
+        assert!(volume_from_allocation(&json!({"acknowledged": true})).is_none());
     }
 
     /// The probe runs before the walk: a flooded node refuses with the

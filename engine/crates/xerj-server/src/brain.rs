@@ -642,6 +642,8 @@ fn index_cfg(cfg: &BrainCfg, brain: &str, api_key: Option<String>) -> IndexCfg {
         // grows its own answer flag. The estimate itself is still printed.
         max_minutes: 0,
         approve: None,
+        max_index_bytes: None,
+        budget_plan: None,
         json: false,
         quiet: false,
         // `xerj brain` is a foreground command a human watches; it gets the

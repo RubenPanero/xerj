@@ -7694,6 +7694,7 @@ dependencies = [
  "tokio",
  "unicode-segmentation",
  "xerj-api",
+ "xerj-autoindex",
  "xerj-common",
  "xerj-engine",
  "xerj-hub",

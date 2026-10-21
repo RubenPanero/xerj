@@ -3,6 +3,7 @@
 //! it does NOT link xerj-engine, works against any endpoint, and cannot
 //! destabilize the server.
 
+pub mod budget;
 pub mod catalog;
 pub mod cli;
 pub mod coerce;
@@ -3520,6 +3521,8 @@ mod phase_a_grouping_tests {
             // behaviour is covered in `gate_tests` and `cli::tests`.
             max_minutes: 0,
             approve: None,
+            max_index_bytes: None,
+            budget_plan: None,
             dry_run: true,
             json: false,
             quiet: true,
@@ -3997,7 +4000,7 @@ fn report_pdf_spool_fallbacks(
     }
     for (path, fallback) in reasons.iter().take(3) {
         pr.note(&format!(
-            "  PDF reuse fallback for {path}: {}",
+            "  PDF reuse fallback for {path}: {}. The PDF is still indexed; phase B parses it again.",
             fallback.message
         ));
     }
@@ -5370,6 +5373,14 @@ fn finish_generated_run(es: &Es, journal: &mut state::Journal, cfg: &IndexCfg) -
         let junk: Vec<&JunkFile> = committed.plan.junk_files.iter().collect();
         unextracted_archive_lines(&junk)
     };
+    // Taken while `committed` still borrows the journal. `journal.finish`
+    // needs that borrow back, and the printed summary (human and --json)
+    // lists the same skips the plan recorded (#2056).
+    let skip_lines = skipped_lines_from_plan(&committed.plan.junk_files);
+    let skip_doc = {
+        let refs: Vec<&JunkFile> = committed.plan.junk_files.iter().collect();
+        skipped_json(&refs)
+    };
     let sync::SourceExecutionPolicy::DurableSnapshot { reference, .. } = &execution.source_policy
     else {
         anyhow::bail!("generated run does not reference a durable snapshot");
@@ -5419,6 +5430,9 @@ fn finish_generated_run(es: &Es, journal: &mut state::Journal, cfg: &IndexCfg) -
     if es.bulk_requests_split() > 0 {
         summary["bulk_splits"] = json!(es.bulk_requests_split());
     }
+    if let Some(skipped) = skip_doc {
+        summary["skipped"] = skipped;
+    }
     journal.finish(&summary)?;
     if cfg.json {
         println!("{summary}");
@@ -5434,6 +5448,9 @@ fn finish_generated_run(es: &Es, journal: &mut state::Journal, cfg: &IndexCfg) -
                 0,
             )
         );
+        for line in &skip_lines {
+            println!("{line}");
+        }
         println!(
             "generation {} committed — {}, {} live",
             generation,
@@ -6041,6 +6058,65 @@ const UNEXTRACTED_PREFIX: &str = "unextracted ";
 /// "successful" empty index with the one sentence that explains it filed where
 /// they would never look (review finding on PR #949). These few lines are the
 /// run saying it.
+const SKIP_LIST_CAP: usize = 20;
+
+/// #2056: names of skipped files, capped, with the reason. The headline stays
+/// one `ok:` line; this is the list under it.
+fn skipped_lines(junk: &[&JunkFile]) -> Vec<String> {
+    if junk.is_empty() {
+        return Vec::new();
+    }
+    let mut rows: Vec<&&JunkFile> = junk.iter().collect();
+    rows.sort_by(|a, b| a.rel.cmp(&b.rel).then(a.reason.cmp(&b.reason)));
+    let mut lines = vec![format!(
+        "skipped: {}",
+        estimate::count_phrase(rows.len() as u64, "file", "files")
+    )];
+    for jf in rows.iter().take(SKIP_LIST_CAP) {
+        lines.push(format!(
+            "  skipped: {} ({}: {})",
+            jf.rel, jf.status, jf.reason
+        ));
+    }
+    if rows.len() > SKIP_LIST_CAP {
+        lines.push(format!(
+            "  … and {} more; `xerj autoindex map` lists every one",
+            rows.len() - SKIP_LIST_CAP
+        ));
+    }
+    lines
+}
+
+fn skipped_lines_from_plan(junk: &[JunkFile]) -> Vec<String> {
+    let refs: Vec<&JunkFile> = junk.iter().collect();
+    skipped_lines(&refs)
+}
+
+fn skipped_json(junk: &[&JunkFile]) -> Option<Value> {
+    if junk.is_empty() {
+        return None;
+    }
+    let mut rows: Vec<&&JunkFile> = junk.iter().collect();
+    rows.sort_by(|a, b| a.rel.cmp(&b.rel).then(a.reason.cmp(&b.reason)));
+    let total = rows.len();
+    let files: Vec<Value> = rows
+        .iter()
+        .take(SKIP_LIST_CAP)
+        .map(|jf| {
+            json!({
+                "path": jf.rel,
+                "status": jf.status,
+                "reason": jf.reason,
+            })
+        })
+        .collect();
+    let mut doc = json!({ "count": total, "files": files });
+    if total > SKIP_LIST_CAP {
+        doc["not_listed"] = json!(total - SKIP_LIST_CAP);
+    }
+    Some(doc)
+}
+
 fn unextracted_archive_lines(junk: &[&JunkFile]) -> Vec<String> {
     const SHOWN: usize = 10;
     let mut hits: Vec<&&JunkFile> = junk
@@ -6332,6 +6408,14 @@ fn legacy_rebuild_argv(cfg: &IndexCfg, state_dir: &Path, prefix: &str) -> Vec<St
     if cfg.no_semantic {
         argv.push("--no-semantic".to_owned());
     }
+    if let Some(bytes) = cfg.max_index_bytes {
+        argv.push("--max-index-size".to_owned());
+        argv.push(bytes.to_string());
+    }
+    if let Some(plan) = &cfg.budget_plan {
+        argv.push("--plan".to_owned());
+        argv.push(plan.clone());
+    }
     if cfg.follow_symlinks {
         argv.push("--follow-symlinks".to_owned());
     }
@@ -6365,12 +6449,11 @@ fn legacy_rebuild_argv(cfg: &IndexCfg, state_dir: &Path, prefix: &str) -> Vec<St
 /// check on a 401 or a 500 would let the overwrite this guard exists to stop
 /// proceed. The caller re-checks the prefix exactly; a legacy analyzed
 /// `prefix` field can over-return sibling corpora.
-fn catalog_runs_for_prefix(es: &Es, prefix: &str) -> Result<Vec<Value>> {
+fn catalog_runs(es: &Es) -> Result<Vec<Value>> {
     let body = json!({
         "size": 500,
         "query": {"bool": {"filter": [
-            {"term": {"doc_kind": "run"}},
-            {"term": {"prefix": prefix}}
+            {"term": {"doc_kind": "run"}}
         ]}}
     });
     let Some(page) = es.search_present(catalog::CATALOG_INDEX, &body)? else {
@@ -6465,6 +6548,12 @@ fn run_index_report_inner(
     // throttle. Its shrink/recover announcements go to stderr, which the
     // progress surface owns — so they are emitted exactly when that surface is
     // enabled, not merely when `--quiet` is absent.
+    // #2057: a digit-leading prefix is rejected by the server only when the
+    // index is created, which used to be after the hash. The name is wrong
+    // before any walk, and it does not need the node.
+    if let Some(err) = dataset::index_prefix_error(&cfg.prefix) {
+        anyhow::bail!("{err}");
+    }
     let es = Es::with_bulk_timeout(&cfg.url, cfg.api_key.clone(), cfg.bulk_timeout_secs)?
         .with_bulk_concurrency(cfg.workers, pr.enabled());
     // #1102: ping's raw context is honest but teaches a first-time user
@@ -6482,13 +6571,18 @@ fn run_index_report_inner(
     // `limits.disk_flood_stage_percent = 99` workaround and a disabled
     // watermark. Nothing has been walked or written yet, so bailing here
     // leaves no journal and no remote mutation.
+    // One allocation read (#2077). The refusal bails before the walk. The
+    // parsed volume is what the budget gate, after the walk and still before
+    // the hash, compares the estimated index against. A second GET is not made.
     // A dry run writes nothing, so a full volume is not a reason to refuse
     // it: the plan (and its size) is exactly what a user short on disk needs.
+    let disk = flood::probe(&es);
     if !cfg.dry_run {
-        if let Some(message) = flood::refusal(&es) {
+        if let Some(message) = disk.refusal {
             anyhow::bail!("{message}");
         }
     }
+    let disk_volume = disk.volume;
 
     // `--label <question-set>` (#1062): every record's payload goes through
     // the node's /_decide at ingest and the answers are stamped on as
@@ -6553,12 +6647,10 @@ fn run_index_report_inner(
     // only remote calls on that path are the readiness GET and the read-only
     // flood-stage probe (#2077), so this guard must not search the catalog
     // there. A different folder has no such journal and still hits the check.
+    let mut duplicate_prefixes: Vec<String> = Vec::new();
     if !state::journal_continues_folder(&state_dir, &root_str, &cfg.url, &cfg.prefix) {
-        let foreign_roots = catalog::foreign_prefix_roots(
-            &catalog_runs_for_prefix(&es, &cfg.prefix)?,
-            &cfg.prefix,
-            &root_str,
-        );
+        let runs = catalog_runs(&es)?;
+        let foreign_roots = catalog::foreign_prefix_roots(&runs, &cfg.prefix, &root_str);
         if !foreign_roots.is_empty() {
             let message = catalog::prefix_reuse_message(
                 &cfg.prefix,
@@ -6576,6 +6668,16 @@ fn run_index_report_inner(
             } else {
                 anyhow::bail!("{message}");
             }
+        }
+        // #2078: the same folder under a second prefix writes a second copy
+        // and used to say nothing. This is a warning, not a refusal — the
+        // prefixes do not share catalog ids.
+        duplicate_prefixes = catalog::other_prefixes_for_root(&runs, &root_str, &cfg.prefix);
+        if !duplicate_prefixes.is_empty() {
+            pr.warn(&catalog::same_root_other_prefix_line(
+                &cfg.prefix,
+                &duplicate_prefixes,
+            ));
         }
     }
     // Acquire state authority before discovery as well as hashing. A waiter
@@ -6849,7 +6951,7 @@ fn run_index_report_inner(
             cfg.exclude_rels.join(", ")
         ));
     }
-    let (discovered_files, data_files, data_bytes) = if cfg.skip_corpus_data {
+    let (mut discovered_files, data_files, data_bytes) = if cfg.skip_corpus_data {
         without_corpus_data_files(discovered_files)
     } else {
         (discovered_files, 0, 0)
@@ -6865,7 +6967,7 @@ fn run_index_report_inner(
              is data, not reference code — pass --include-data to index them"
         ));
     }
-    let discovered_bytes: u64 = discovered_files.iter().map(|f| f.size).sum();
+    let mut discovered_bytes: u64 = discovered_files.iter().map(|f| f.size).sum();
     pr.note(&format!(
         "autoindex: {} files ({} MB) under {}",
         discovered_files.len(),
@@ -6884,6 +6986,82 @@ fn run_index_report_inner(
         println!("no files found under {root_str}");
         pr.finish(true, 0, "no-files", &[]);
         return Ok((0, None));
+    }
+    // Count, estimate, and — when the default plan does not fit the disk
+    // budget — stop before hashing. The volume is the allocation row read
+    // above; this does not probe the disk again.
+    {
+        let assessment = budget::assess(&budget::Request {
+            root: &root_str,
+            files: &discovered_files,
+            volume: disk_volume,
+            max_index_bytes: cfg.max_index_bytes,
+            no_semantic: cfg.no_semantic,
+            plan: cfg.budget_plan.as_deref(),
+            approve: cfg.approve,
+            duplicate_prefixes: &duplicate_prefixes,
+        });
+        for line in &assessment.lines {
+            if assessment.needs_choice {
+                pr.note(line);
+            }
+        }
+        let choice = if assessment.needs_choice {
+            let blocked = gate::detect_prompt_block(pr.enabled());
+            if let Some(why) = blocked {
+                pr.note(&format!(
+                    "budget: {}. Re-run with --plan <name> or --yes",
+                    why.explain()
+                ));
+                budget::Choice::Absent
+            } else {
+                budget::read_choice(
+                    &mut std::io::stdin().lock(),
+                    &assessment.plan_names,
+                    |line| {
+                        pr.note(line);
+                    },
+                )
+            }
+        } else {
+            budget::Choice::Absent
+        };
+        match budget::resolve(&assessment, choice) {
+            budget::Outcome::Stop { code, body } => {
+                if !body.is_null() {
+                    println!("{}", serde_json::to_string(&body)?);
+                }
+                if code == 0 {
+                    pr.note("gate: --approve cancel — nothing was indexed");
+                    pr.finish(true, 0, "cancelled", &[]);
+                } else {
+                    pr.finish(false, code, "needs-decision", &[]);
+                }
+                return Ok((code, None));
+            }
+            budget::Outcome::Continue {
+                keep,
+                no_semantic,
+                note,
+            } => {
+                if no_semantic {
+                    cfg.no_semantic = true;
+                }
+                if let Some(keep) = keep {
+                    let keep: std::collections::HashSet<String> = keep.into_iter().collect();
+                    let before = discovered_files.len();
+                    discovered_files.retain(|f| keep.contains(&f.rel));
+                    discovered_bytes = discovered_files.iter().map(|f| f.size).sum();
+                    pr.note(&format!(
+                        "autoindex: budget plan kept {} of {before} walked files",
+                        discovered_files.len()
+                    ));
+                }
+                if !note.is_empty() {
+                    pr.note(&format!("autoindex: {note}"));
+                }
+            }
+        }
     }
     // Full hashing on every run is deliberate: size/mtime/inode fingerprints
     // cannot prove byte identity across all supported local and network
@@ -9824,6 +10002,15 @@ fn run_index_report_inner(
     if skipped_appeared > 0 {
         run_doc["skipped_appeared"] = json!(skipped_appeared);
     }
+    // #2056: the exit-3 headline stays one line. The paths themselves are a
+    // separate list, capped, with the reason. Present only when something
+    // was skipped, so a clean run document is unchanged.
+    if let Some(skipped) = skipped_json(&all_junk) {
+        run_doc["skipped"] = skipped;
+    }
+    // Owned lines: the resume-plan update below mutates `plan.junk_files`,
+    // which `all_junk` borrows. The summary prints these after that update.
+    let skip_lines = skipped_lines(&all_junk);
     push_doc(&format!("run:{run_id}"), &run_doc, &mut cat_buf);
 
     if !cat_buf.is_empty() {
@@ -9921,6 +10108,9 @@ fn run_index_report_inner(
                 skipped_appeared as u64,
             )
         );
+        for line in &skip_lines {
+            println!("{line}");
+        }
         println!(
             "{}",
             estimate::done_summary_line(
